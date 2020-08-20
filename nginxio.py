@@ -54,8 +54,210 @@ class TOKEN_OCTOTHORPE(TOKEN, namedtuple('TOKEN_OCTOTHORPE', ['line'])):
 
 
 class NginXObject(object):
+  def __init__(self):
+    self.tags = []
+    self._tagsByName = {}
+
   def __str__(self):
     return self.ToIndentedString()
+
+  @classmethod
+  def FromString(cls, content):
+    return cls(cls.RunStream(cls.GetStringContents(content)))
+
+  @classmethod
+  def FromFile(cls, filename):
+    return cls(cls.RunStream(cls.GetFileContents(filename)))
+
+  @classmethod
+  def GetFileContents(cls, filename):
+    with open(filename, 'r') as f:
+      yield from enumerate(f.readlines())
+
+  @classmethod
+  def GetStringContents(cls, stringcontent):
+    yield from enumerate(stringcontent.split('\n'))
+
+  @classmethod
+  def RunStream(cls, stream):
+    steps = [
+      cls._skipSpaces, # STRING, NEWLINE
+      cls._separateOctothorpes,
+      cls._renameOctothorpes,
+      cls._extractComments, # COMMENT
+      cls._separateSymbols,
+      cls._renameSemicolons,
+      cls._renameTerminals,
+      cls._createNested, # NESTED
+      cls._typenested, # PROP, ENTRY
+    ]
+    for step in steps:
+      stream = step(stream)
+    return stream
+
+  @classmethod
+  def _skipSpaces(cls, stream):
+    for line, chunk in stream:
+      for c in chunk.split():
+        yield TOKEN_STRING(line+1, c)
+      yield TOKEN_NEWLINE(line+1)
+
+  @classmethod
+  def _separateTokens(cls, starts=[], ends=[]):
+    def gentake(start=None, end=None):
+      def GEN(S):
+        for token in S:
+          if token.isA(TOKEN_NEWLINE):
+            yield token
+          elif token.isA(TOKEN_STRING):
+            ss = token.str
+            while start and ss.startswith(start):
+              yield TOKEN_STRING(token.line, start)
+              ss = ss[1:]
+            ends_cnt = 0
+            while end and ss.endswith(end):
+              ends_cnt += 1
+              ss = ss[:-1]
+            if ss:
+              yield TOKEN_STRING(token.line, ss)
+            for _ in range(ends_cnt):
+              yield TOKEN_STRING(token.line, end)
+          else:
+            yield token
+      return GEN
+
+    def gengen(S, G, *gens):
+      if not gens:
+        yield from G(S)
+      else:
+        yield from G(gengen(S, *gens))
+
+    def runner(stream):
+      tokens = [
+        gentake(start=x) for x in starts
+      ] + [
+        gentake(end=x) for x in ends
+      ]
+      yield from gengen(stream, *tokens)
+
+    return runner
+
+  @classmethod
+  def _separateOctothorpes(cls, stream):
+    return cls._separateTokens(starts=['#'])(stream)
+
+  @classmethod
+  def _separateSymbols(cls, stream):
+    return cls._separateTokens(starts=['{', '('], ends=['}', ')', ';'])(stream)
+
+  @classmethod
+  def _renameOctothorpes(cls, stream):
+    return cls._nameTokens({'#': TOKEN_OCTOTHORPE})(stream)
+
+  @classmethod
+  def _renameSemicolons(cls, stream):
+    return cls._nameTokens({';': TOKEN_SEMICOLON})(stream)
+
+  @classmethod
+  def _renameTerminals(cls, stream):
+    return cls._nameTokens({
+      '{': TOKEN_OPEN_BRACE,
+      '}': TOKEN_CLOSE_BRACE,
+      '(': TOKEN_OPEN_PAREN,
+      ')': TOKEN_CLOSE_PAREN,
+    })(stream)
+
+  @classmethod
+  def _nameTokens(cls, rename_to):
+    def helper(stream):
+      for tok in stream:
+        if tok.isA(TOKEN_STRING):
+          if tok.str in rename_to:
+            yield rename_to[tok.str](tok.line)
+          else:
+            yield tok
+        else:
+          yield tok
+    return helper
+
+  @classmethod
+  def _extractComments(cls, stream):
+    comment = None
+    stream = iter(stream)
+    try:
+      while True:
+        tok = next(stream)
+        if tok.isA(TOKEN_NEWLINE):
+          if comment is not None:
+            yield TOKEN_COMMENT(tok.line, ' '.join(comment))
+            comment = None
+          yield tok
+        elif tok.isA(TOKEN_OCTOTHORPE):
+          if comment is None:
+            comment = []
+          else:
+            comment.append('#')
+        elif tok.isA(TOKEN_STRING):
+          if comment is not None:
+            comment.append(tok.str)
+          else:
+            yield tok
+        else:
+          yield tok
+    except StopIteration:
+      if comment is not None:
+        yield TOKEN_COMMENT(' '.join(comment))
+
+  @classmethod
+  def _createNested(cls, stream):
+    def _helper(S):
+      try:
+        while True:
+          tok = next(S)
+          if tok.isA(TOKEN_OPEN_BRACE):
+            yield TOKEN_NESTED(tok.line, list(_helper(S)))
+          elif tok.isA(TOKEN_CLOSE_BRACE):
+            break
+          else:
+            yield tok
+      except StopIteration:
+        pass
+    return _helper(iter(stream))
+
+  @classmethod
+  def _typenested(cls, stream):
+    def helper(S):
+      key = None
+      values = []
+      for token in S:
+        if token.isA(TOKEN_STRING) and (key is None):
+          key = token.str
+        elif token.isA(TOKEN_STRING) and (key is not None):
+          values.append(token.str)
+        elif token.isA(TOKEN_NEWLINE):
+          # Do nothing on a newline
+          pass
+        elif token.isA(TOKEN_SEMICOLON):
+          assert len(values) > 0, f'Semicolon found with no values in {S}'
+          yield TOKEN_PROP(token.line, key, values)
+          key = None
+          values = []
+        elif token.isA(TOKEN_COMMENT):
+          yield token
+        elif token.isA(TOKEN_OPEN_PAREN):
+          assert key == 'if'
+          values.append('(')
+        elif token.isA(TOKEN_CLOSE_PAREN):
+          assert key == 'if'
+          values.append(')')
+        elif token.isA(TOKEN_NESTED):
+          assert key is not None
+          values.append(list(helper(token.stream)))
+          yield TOKEN_ENTRY(token.line, key, values)
+          key = None
+          values = []
+    yield from helper(stream)
+
 
   def ParseStream(self, stream, named_entries):
     trailing_comment = []
@@ -68,6 +270,7 @@ class NginXObject(object):
       elif token.isA(TOKEN_PROP):
         self.tags.append(NginXProperty(
           token.key, token.values, ' '.join(trailing_comment)))
+        self._tagsByName[token.key] = self.tags[-1]
         trailing_comment = []
       elif token.isA(TOKEN_ENTRY):
         assert token.key in named_entries.keys(), f'{token.key} not in {named_entries}'
@@ -75,6 +278,30 @@ class NginXObject(object):
         trailing_comment = []
       else:
         raise ValueError(str(token))
+
+  def ToIndentedString(self):
+    raise ValueError('Cant call ToIndentedString on a base NginXObject')
+
+  def NamedProperty(self, prop):
+    return self._tagsByName.get(prop).value
+
+  def HasProperty(self, property):
+    return property in self._tagsByName
+
+  def SetNamedProperty(self, prop, value):
+    newprop = NginXProperty(prop, [value], '')
+    newtags = []
+    for tag in self.tags:
+      if tag.name == prop:
+        newtags.append(newprop)
+        self._tagsByName[prop] = newprop
+      else:
+        newtags.append(tag)
+    self.tas = newtags
+
+
+  
+
 
 
 def chop_comment(comment, spacer, line_length=80):
@@ -123,193 +350,15 @@ def format_properties(props, idt=0, indent='  '):
 
 
 class NginXConfig(NginXObject):
-  def __init__(self):
-    pass
-
-  def RunStream(self, filename):
-    stream = self.readfile(filename)
-    steps = [
-      self._skipSpaces, # STRING, NEWLINE
-      self._separateOctothorpes,
-      self._renameOctothorpes,
-      self._extractComments, # COMMENT
-      self._separateSymbols,
-      self._renameSemicolons,
-      self._renameTerminals,
-      self._createNested, # NESTED
-      self._typenested, # PROP, ENTRY
-    ]
-    for step in steps:
-      stream = step(stream)
-    return stream
-
-  def readfile(self, fname):
-    with open(fname, 'r') as f:
-      yield from enumerate(f.readlines())
-
-  def _skipSpaces(self, stream):
-    for line, chunk in stream:
-      for c in chunk.split():
-        yield TOKEN_STRING(line+1, c)
-      yield TOKEN_NEWLINE(line+1)
-
-  def _separateTokens(self, starts=[], ends=[]):
-    def gentake(start=None, end=None):
-      def GEN(S):
-        for token in S:
-          if token.isA(TOKEN_NEWLINE):
-            yield token
-          elif token.isA(TOKEN_STRING):
-            ss = token.str
-            while start and ss.startswith(start):
-              yield TOKEN_STRING(token.line, start)
-              ss = ss[1:]
-            ends_cnt = 0
-            while end and ss.endswith(end):
-              ends_cnt += 1
-              ss = ss[:-1]
-            if ss:
-              yield TOKEN_STRING(token.line, ss)
-            for _ in range(ends_cnt):
-              yield TOKEN_STRING(token.line, end)
-          else:
-            yield token
-      return GEN
-
-    def gengen(S, G, *gens):
-      if not gens:
-        yield from G(S)
-      else:
-        yield from G(gengen(S, *gens))
-
-    def runner(stream):
-      tokens = [
-        gentake(start=x) for x in starts
-      ] + [
-        gentake(end=x) for x in ends
-      ]
-      yield from gengen(stream, *tokens)
-
-    return runner
-
-  def _separateOctothorpes(self, stream):
-    return self._separateTokens(starts=['#'])(stream)
-
-  def _separateSymbols(self, stream):
-    return self._separateTokens(starts=['{', '('], ends=['}', ')', ';'])(stream)
-
-  def _renameOctothorpes(self, stream):
-    return self._nameTokens({'#': TOKEN_OCTOTHORPE})(stream)
-
-  def _renameSemicolons(self, stream):
-    return self._nameTokens({';': TOKEN_SEMICOLON})(stream)
-
-  def _renameTerminals(self, stream):
-    return self._nameTokens({
-      '{': TOKEN_OPEN_BRACE,
-      '}': TOKEN_CLOSE_BRACE,
-      '(': TOKEN_OPEN_PAREN,
-      ')': TOKEN_CLOSE_PAREN,
-    })(stream)
-
-  def _nameTokens(self, rename_to):
-    def helper(stream):
-      for tok in stream:
-        if tok.isA(TOKEN_STRING):
-          if tok.str in rename_to:
-            yield rename_to[tok.str](tok.line)
-          else:
-            yield tok
-        else:
-          yield tok
-    return helper
-
-  def _extractComments(self, stream):
-    comment = None
-    stream = iter(stream)
-    try:
-      while True:
-        tok = next(stream)
-        if tok.isA(TOKEN_NEWLINE):
-          if comment is not None:
-            yield TOKEN_COMMENT(tok.line, ' '.join(comment))
-            comment = None
-          yield tok
-        elif tok.isA(TOKEN_OCTOTHORPE):
-          if comment is None:
-            comment = []
-          else:
-            comment.append('#')
-        elif tok.isA(TOKEN_STRING):
-          if comment is not None:
-            comment.append(tok.str)
-          else:
-            yield tok
-        else:
-          yield tok
-    except StopIteration:
-      if comment is not None:
-        yield TOKEN_COMMENT(' '.join(comment))
-
-  def _createNested(self, stream):
-    def _helper(S):
-      try:
-        while True:
-          tok = next(S)
-          if tok.isA(TOKEN_OPEN_BRACE):
-            yield TOKEN_NESTED(tok.line, list(_helper(S)))
-          elif tok.isA(TOKEN_CLOSE_BRACE):
-            break
-          else:
-            yield tok
-      except StopIteration:
-        pass
-    return _helper(iter(stream))
-
-  def _typenested(self, stream):
-    def helper(S):
-      key = None
-      values = []
-      for token in S:
-        if token.isA(TOKEN_STRING) and (key is None):
-          key = token.str
-        elif token.isA(TOKEN_STRING) and (key is not None):
-          values.append(token.str)
-        elif token.isA(TOKEN_NEWLINE):
-          # Do nothing on a newline
-          pass
-        elif token.isA(TOKEN_SEMICOLON):
-          assert len(values) > 0, f'Semicolon found with no values in {S}'
-          yield TOKEN_PROP(token.line, key, values)
-          key = None
-          values = []
-        elif token.isA(TOKEN_COMMENT):
-          yield token
-        elif token.isA(TOKEN_OPEN_PAREN):
-          assert key == 'if'
-          values.append('(')
-        elif token.isA(TOKEN_CLOSE_PAREN):
-          assert key == 'if'
-          values.append(')')
-        elif token.isA(TOKEN_NESTED):
-          assert key is not None
-          values.append(list(helper(token.stream)))
-          yield TOKEN_ENTRY(token.line, key, values)
-          key = None
-          values = []
-    yield from helper(stream)
-
-  def ParseFile(self, fname):
-    self.ParseStream(self.RunStream(fname), {
+  __slots__ = ('http', 'stream')
+  def __init__(self, values):
+    super().__init__()
+    self.http = None
+    self.stream = None
+    self.ParseStream(values, {
       'events': self._ParseEvents,
       'http': self._ParseHTTP
     })
-
-  def _ParseEvents(self, values, comment):
-    self.events = NginXEvents(values[0], comment)
-
-  def _ParseHTTP(self, values, comment):
-    self.http = NginXHTTP(values[0], comment)
 
   def ToIndentedString(self, idt=0, indent='  '):
     assert idt == 0, 'Cant call ToIndentedString on NginXConfig an indent'
@@ -318,8 +367,21 @@ class NginXConfig(NginXObject):
     http = self.http.ToIndentedString(idt, indent)
     return f'{tags}\n{events}\n\n{http}'
 
+  def _ParseEvents(self, values, comment):
+    self.events = NginXEvents(values[0], comment)
+
+  def _ParseHTTP(self, values, comment):
+    self.http = NginXHTTP(values[0], comment)
+
+  def WriteToFile(self, filename):
+    with open(filename, 'w') as f:
+      f.write(self.ToIndentedString())
+
 
 class NginXBracedObject(NginXObject):
+  def __init__(self):
+    super().__init__()
+
   def ToIndentedString(self, idt=0, indent='  '):
     indentation = indent * idt
     result = f'{indentation}{self.GetBraceName()}{{'
@@ -353,6 +415,7 @@ class NginXProperty(object):
 
 class NginXEvents(NginXBracedObject):
   def __init__(self, values, comment=''):
+    super().__init__()
     self.comment = comment
     self.ParseStream(values, {})
 
@@ -369,7 +432,9 @@ class NginXEvents(NginXBracedObject):
 
 
 class NginXHTTP(NginXBracedObject):
+  __slots__ = ('servers', 'comment', 'upstreams')
   def __init__(self, values, comment=''):
+    super().__init__()
     self.comment = comment
     self.servers = []
     self.upstreams = []
@@ -404,6 +469,7 @@ class NginXHTTP(NginXBracedObject):
 
 class NginXServer(NginXBracedObject):
   def __init__(self, values, comment=''):
+    super().__init__()
     self.comment = comment
     self.locations = []
     self.conditions = []
@@ -438,6 +504,7 @@ class NginXServer(NginXBracedObject):
 
 class NginXLocation(NginXBracedObject):
   def __init__(self, location, values, comment=''):
+    super().__init__()
     self.comment = comment
     self.location = ' '.join(location)
     self.conditions = []
@@ -462,6 +529,7 @@ class NginXLocation(NginXBracedObject):
 
 class NginXCondition(NginXBracedObject):
   def __init__(self, values, comment=''):
+    super().__init__()
     self.comment = comment
     self.condition_string = []
     self.body = None
