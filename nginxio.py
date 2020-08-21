@@ -297,7 +297,7 @@ class NginXObject(object):
         self._tagsByName[prop] = newprop
       else:
         newtags.append(tag)
-    self.tas = newtags
+    self.tags = newtags
 
 
   
